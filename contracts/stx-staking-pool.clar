@@ -124,3 +124,118 @@
             u2
             u1))
 )
+
+;; Governance System
+(define-public (create-proposal (description (string-utf8 256)))
+    (let (
+        (proposal-id (var-get governance-proposal-id))
+        (start-block stacks-block-height)
+        (end-block (+ start-block governance-voting-period))
+        (staker-balance (get-staker-balance tx-sender))
+    )
+    (asserts! (>= staker-balance tier-2-minimum) (err u109))
+    
+    ;; Create new proposal
+    (map-set governance-proposals proposal-id {
+        proposer: tx-sender,
+        start-block: start-block,
+        end-block: end-block,
+        description: description,
+        active: true
+    })
+    
+    ;; Initialize vote counts
+    (map-set governance-vote-counts proposal-id {yes: u0, no: u0})
+    
+    ;; Increment proposal ID
+    (var-set governance-proposal-id (+ proposal-id u1))
+    
+    (ok proposal-id))
+)
+
+(define-public (vote (proposal-id uint) (vote-bool bool))
+    (let (
+        (proposal (unwrap! (map-get? governance-proposals proposal-id) err-proposal-not-active))
+        (vote-power (get-vote-power tx-sender))
+        (current-votes (default-to {yes: u0, no: u0} (map-get? governance-vote-counts proposal-id)))
+    )
+    (asserts! (not (default-to false (map-get? governance-votes {proposal: proposal-id, voter: tx-sender}))) err-already-voted)
+    (asserts! (and (>= stacks-block-height (get start-block proposal)) (<= stacks-block-height (get end-block proposal))) err-proposal-not-active)
+    
+    ;; Record vote
+    (map-set governance-votes {proposal: proposal-id, voter: tx-sender} vote-bool)
+    
+    ;; Update vote counts
+    (if vote-bool
+        (map-set governance-vote-counts proposal-id 
+            {yes: (+ (get yes current-votes) vote-power), 
+             no: (get no current-votes)})
+        (map-set governance-vote-counts proposal-id 
+            {yes: (get yes current-votes), 
+             no: (+ (get no current-votes) vote-power)}))
+    
+    (ok true))
+)
+
+
+
+(define-private (get-vote-power (staker principal))
+    (let (
+        (balance (get-staker-balance staker))
+        (tier (default-to u1 (map-get? staker-tiers staker)))
+    )
+    (/ (* balance tier) u100)) ;; Vote power = balance * tier / 100
+)
+
+;; Price Oracle Integration
+(define-public (update-price (new-price uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (var-set last-price new-price)
+        (ok new-price))
+)
+
+;; Enhanced reward calculation with tiers
+(define-public (calculate-rewards (staker principal))
+    (let (
+        (staker-balance (get-staker-balance staker))
+        (staker-tier (default-to u1 (map-get? staker-tiers staker)))
+        (tier-multiplier (get-tier-multiplier staker-tier))
+        (total (var-get total-staked))
+        (cycle-rewards (default-to u0 (map-get? reward-distribution (- (var-get reward-cycle) u1))))
+    )
+    (if (is-eq total u0)
+        (ok u0)
+        (ok (/ (* (* staker-balance cycle-rewards) tier-multiplier) (* total u1000))))
+))
+
+(define-private (get-tier-multiplier (tier uint))
+    (if (is-eq tier u3)
+        tier-3-multiplier
+        (if (is-eq tier u2)
+            tier-2-multiplier
+            tier-1-multiplier))
+)
+
+;; Emergency functions with timelock
+(define-data-var emergency-timelock uint u0)
+(define-constant timelock-delay u144) ;; ~24 hours in blocks
+
+(define-public (initiate-emergency-withdrawal)
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (var-set emergency-timelock (+ stacks-block-height timelock-delay))
+        (ok stacks-block-height))
+)
+
+(define-public (execute-emergency-withdrawal)
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (>= stacks-block-height (var-get emergency-timelock)) (err u110))
+        (let (
+            (balance (stx-get-balance (as-contract tx-sender)))
+        )
+        (try! (as-contract (stx-transfer? balance (as-contract tx-sender) contract-owner)))
+        (ok balance)))
+)
+
